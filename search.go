@@ -1,247 +1,229 @@
 package main
 
 import (
-	"fmt"
-	. "github.com/antonmedv/fx/pkg/dict"
-	. "github.com/antonmedv/fx/pkg/json"
 	"regexp"
+
+	tea "charm.land/bubbletea/v2"
+
+	. "github.com/antonmedv/fx/internal/jsonx"
 )
 
-type searchResult struct {
-	path   string
-	index  int
-	ranges []*foundRange
+func (m *model) doSearch(s string) tea.Cmd {
+	if s == "" {
+		return nil
+	}
+
+	m.searching = true
+	m.searchID++
+	m.searchCancel = make(chan struct{})
+	id := m.searchID
+	cancel := m.searchCancel
+	top := m.top
+	query := s
+
+	return tea.Batch(m.spinner.Tick, func() tea.Msg {
+		result, err := executeSearch(top, query, cancel)
+		if err != nil {
+			errSearch := newSearch()
+			errSearch.err = err
+			return searchResultMsg{id: id, query: query, search: errSearch}
+		}
+		if result == nil {
+			// Search was cancelled
+			return searchCancelledMsg{}
+		}
+		return searchResultMsg{id: id, query: query, search: result}
+	})
 }
 
-type rangeKind int
-
-const (
-	keyRange rangeKind = 1 + iota
-	valueRange
-	delimRange
-	openBracketRange
-	closeBracketRange
-	commaRange
-)
-
-type foundRange struct {
-	parent *searchResult
-	// Range needs separate path, as for one searchResult's path
-	// there can be multiple ranges for different paths (within parent path).
-	path       string
-	start, end int
-	kind       rangeKind
+func (m *model) cancelSearch() {
+	if m.searchCancel != nil {
+		close(m.searchCancel)
+		m.searchCancel = nil
+		m.searching = false
+	}
 }
 
-type rangeGroup struct {
-	key          []*foundRange
-	value        []*foundRange
-	delim        []*foundRange
-	openBracket  *foundRange
-	closeBracket *foundRange
-	comma        *foundRange
-}
-
-func (m *model) clearSearchResults() {
-	m.searchRegexCompileError = ""
-	m.searchResults = nil
-	m.highlightIndex = nil
-}
-
-func (m *model) doSearch(s string) {
-	m.clearSearchResults()
-	re, err := regexp.Compile("(?i)" + s)
-	if err != nil {
-		m.searchRegexCompileError = err.Error()
-		m.searchInput.Blur()
+func (m *model) selectSearchResult(i int) {
+	if len(m.search.results) == 0 {
 		return
 	}
-	indexes := re.FindAllStringIndex(Stringify(m.json), -1)
-	m.remapSearchResult(m.json, "", 0, indexes, 0, nil)
-	m.indexSearchResults()
-	m.searchInput.Blur()
-	m.showSearchResults = true
-	m.jumpToSearchResult(0)
-}
-
-func (m *model) remapSearchResult(object interface{}, path string, pos int, indexes [][]int, id int, current *searchResult) (int, int, *searchResult) {
-	switch object.(type) {
-	case nil:
-		s := "null"
-		id, current = m.findRanges(valueRange, s, path, pos, indexes, id, current)
-		return pos + len(s), id, current
-
-	case bool:
-		var s string
-		if object.(bool) {
-			s = "true"
-		} else {
-			s = "false"
-		}
-		id, current = m.findRanges(valueRange, s, path, pos, indexes, id, current)
-		return pos + len(s), id, current
-
-	case Number:
-		s := object.(Number).String()
-		id, current = m.findRanges(valueRange, s, path, pos, indexes, id, current)
-		return pos + len(s), id, current
-
-	case string:
-		s := fmt.Sprintf("%q", object)
-		id, current = m.findRanges(valueRange, s, path, pos, indexes, id, current)
-		return pos + len(s), id, current
-
-	case *Dict:
-		id, current = m.findRanges(openBracketRange, "{", path, pos, indexes, id, current)
-		pos++ // {
-		for i, k := range object.(*Dict).Keys {
-			subpath := path + "." + k
-
-			key := fmt.Sprintf("%q", k)
-			id, current = m.findRanges(keyRange, key, subpath, pos, indexes, id, current)
-			pos += len(key)
-
-			delim := ": "
-			id, current = m.findRanges(delimRange, delim, subpath, pos, indexes, id, current)
-			pos += len(delim)
-
-			pos, id, current = m.remapSearchResult(object.(*Dict).Values[k], subpath, pos, indexes, id, current)
-			if i < len(object.(*Dict).Keys)-1 {
-				comma := ","
-				id, current = m.findRanges(commaRange, comma, subpath, pos, indexes, id, current)
-				pos += len(comma)
-			}
-		}
-		id, current = m.findRanges(closeBracketRange, "}", path, pos, indexes, id, current)
-		pos++ // }
-		return pos, id, current
-
-	case Array:
-		id, current = m.findRanges(openBracketRange, "[", path, pos, indexes, id, current)
-		pos++ // [
-		for i, v := range object.(Array) {
-			subpath := fmt.Sprintf("%v[%v]", path, i)
-			pos, id, current = m.remapSearchResult(v, subpath, pos, indexes, id, current)
-			if i < len(object.(Array))-1 {
-				comma := ","
-				id, current = m.findRanges(commaRange, comma, subpath, pos, indexes, id, current)
-				pos += len(comma)
-			}
-		}
-		id, current = m.findRanges(closeBracketRange, "]", path, pos, indexes, id, current)
-		pos++ // ]
-		return pos, id, current
-
-	default:
-		panic("unexpected object type")
-	}
-}
-
-func (m *model) findRanges(kind rangeKind, s string, path string, pos int, indexes [][]int, id int, current *searchResult) (int, *searchResult) {
-	for ; id < len(indexes); id++ {
-		start, end := indexes[id][0]-pos, indexes[id][1]-pos
-		if end <= 0 {
-			current = nil
-			continue
-		}
-		if start < len(s) {
-			if current == nil {
-				current = &searchResult{
-					path:  path,
-					index: len(m.searchResults),
-				}
-				m.searchResults = append(m.searchResults, current)
-			}
-			found := &foundRange{
-				parent: current,
-				path:   path,
-				start:  max(start, 0),
-				end:    min(end, len(s)),
-				kind:   kind,
-			}
-			current.ranges = append(current.ranges, found)
-			if end < len(s) {
-				current = nil
-			} else {
-				break
-			}
-		} else {
-			break
-		}
-	}
-	return id, current
-}
-
-func (m *model) indexSearchResults() {
-	m.highlightIndex = map[string]*rangeGroup{}
-	for _, s := range m.searchResults {
-		for _, r := range s.ranges {
-			highlight, exist := m.highlightIndex[r.path]
-			if !exist {
-				highlight = &rangeGroup{}
-				m.highlightIndex[r.path] = highlight
-			}
-			switch r.kind {
-			case keyRange:
-				highlight.key = append(highlight.key, r)
-			case valueRange:
-				highlight.value = append(highlight.value, r)
-			case delimRange:
-				highlight.delim = append(highlight.delim, r)
-			case openBracketRange:
-				highlight.openBracket = r
-			case closeBracketRange:
-				highlight.closeBracket = r
-			case commaRange:
-				highlight.comma = r
-			}
-		}
-	}
-}
-
-func (m *model) jumpToSearchResult(at int) {
-	if len(m.searchResults) == 0 {
-		return
-	}
-	m.showCursor = false
-	m.searchResultsCursor = at % len(m.searchResults)
-	desiredPath := m.searchResults[m.searchResultsCursor].path
-	lineNumber, ok := m.pathToLineNumber[desiredPath]
-	if ok {
-		m.cursor = m.pathToIndex[desiredPath]
-		m.SetOffset(lineNumber)
-		m.render()
-	} else {
-		m.expandToPath(desiredPath)
-		m.render()
-		m.jumpToSearchResult(at)
-	}
-}
-
-func (m *model) expandToPath(path string) {
-	m.expandedPaths[path] = true
-	if path != "" {
-		m.expandToPath(m.parents[path])
-	}
-}
-
-func (m *model) nextSearchResult() {
-	if len(m.searchResults) > 0 {
-		m.jumpToSearchResult((m.searchResultsCursor + 1) % len(m.searchResults))
-	}
-}
-
-func (m *model) prevSearchResult() {
-	i := m.searchResultsCursor - 1
 	if i < 0 {
-		i = len(m.searchResults) - 1
+		i = len(m.search.results) - 1
 	}
-	m.jumpToSearchResult(i)
+	if i >= len(m.search.results) {
+		i = 0
+	}
+	m.search.cursor = i
+	result := m.search.results[i]
+	m.selectNode(result)
+	m.showCursor = false
 }
 
-func (m *model) resultsCursorPath() string {
-	if len(m.searchResults) == 0 {
-		return "?"
+func (m *model) redoSearch() {
+	s := m.searchInput.Value()
+	if s == "" || len(m.search.results) == 0 {
+		return
 	}
-	return m.searchResults[m.searchResultsCursor].path
+
+	cursor := m.search.cursor
+
+	// Perform search synchronously (no cancellation needed for redo)
+	result, err := executeSearch(m.top, s, nil)
+	if err != nil {
+		m.search = newSearch()
+		m.search.err = err
+		return
+	}
+
+	m.search = result
+	m.selectSearchResult(cursor)
+}
+
+type search struct {
+	err     error
+	results []*Node
+	cursor  int
+	values  map[*Node][]match
+	keys    map[*Node][]match
+}
+
+func newSearch() *search {
+	return &search{
+		results: make([]*Node, 0),
+		values:  make(map[*Node][]match),
+		keys:    make(map[*Node][]match),
+	}
+}
+
+type match struct {
+	start, end int
+	index      int
+}
+
+type piece struct {
+	b     string
+	index int
+}
+
+// executeSearch performs the core search logic and returns the results.
+// It can be cancelled via the cancel channel (pass nil for non-cancellable search).
+func executeSearch(top *Node, s string, cancel <-chan struct{}) (*search, error) {
+	code, ci := regexCase(s)
+	if ci {
+		code = "(?i)" + code
+	}
+
+	re, err := regexp.Compile(code)
+	if err != nil {
+		return nil, err
+	}
+
+	result := newSearch()
+	n := top
+	searchIndex := 0
+
+	for n != nil {
+		// Check for cancellation if channel provided
+		if cancel != nil {
+			select {
+			case <-cancel:
+				return nil, nil // cancelled
+			default:
+			}
+		}
+
+		if n.Key != "" {
+			indexes := re.FindAllStringIndex(n.Key, -1)
+			if len(indexes) > 0 {
+				for i, pair := range indexes {
+					result.results = append(result.results, n)
+					result.keys[n] = append(result.keys[n], match{start: pair[0], end: pair[1], index: searchIndex + i})
+				}
+				searchIndex += len(indexes)
+			}
+		}
+		indexes := re.FindAllStringIndex(n.Value, -1)
+		if len(indexes) > 0 {
+			for range indexes {
+				result.results = append(result.results, n)
+			}
+			if n.Chunk != "" {
+				// String can be split into chunks, so we need to map the indexes to the chunks.
+				chunks := []string{n.Chunk}
+				chunkNodes := []*Node{n}
+
+				it := n.Next
+				for it != nil {
+					chunkNodes = append(chunkNodes, it)
+					chunks = append(chunks, it.Chunk)
+					if it == n.ChunkEnd {
+						break
+					}
+					it = it.Next
+				}
+
+				chunkMatches := splitIndexesToChunks(chunks, indexes, searchIndex)
+				for i, matches := range chunkMatches {
+					result.values[chunkNodes[i]] = matches
+				}
+			} else {
+				for i, pair := range indexes {
+					result.values[n] = append(result.values[n], match{start: pair[0], end: pair[1], index: searchIndex + i})
+				}
+			}
+			searchIndex += len(indexes)
+		}
+
+		if n.IsCollapsed() {
+			n = n.Collapsed
+		} else {
+			n = n.Next
+		}
+	}
+
+	return result, nil
+}
+
+func splitByIndexes(s string, indexes []match) []piece {
+	out := make([]piece, 0, 1)
+	pos := 0
+	for _, pair := range indexes {
+		out = append(out, piece{safeSlice(s, pos, pair.start), -1})
+		out = append(out, piece{safeSlice(s, pair.start, pair.end), pair.index})
+		pos = pair.end
+	}
+	out = append(out, piece{safeSlice(s, pos, len(s)), -1})
+	return out
+}
+
+func splitIndexesToChunks(chunks []string, indexes [][]int, searchIndex int) (chunkIndexes [][]match) {
+	chunkIndexes = make([][]match, len(chunks))
+
+	for index, idx := range indexes {
+		position := 0
+		for i, chunk := range chunks {
+			// If start index lies in this chunk
+			if idx[0] < position+len(chunk) {
+				// Calculate local start and end for this chunk
+				localStart := idx[0] - position
+				localEnd := idx[1] - position
+
+				// If the end index also lies in this chunk
+				if idx[1] <= position+len(chunk) {
+					chunkIndexes[i] = append(chunkIndexes[i], match{start: localStart, end: localEnd, index: searchIndex + index})
+					break
+				} else {
+					// If the end index is outside this chunk, split the index
+					chunkIndexes[i] = append(chunkIndexes[i], match{start: localStart, end: len(chunk), index: searchIndex + index})
+
+					// Adjust the starting index for the next chunk
+					idx[0] = position + len(chunk)
+				}
+			}
+			position += len(chunk)
+		}
+	}
+
+	return
 }
